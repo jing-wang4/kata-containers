@@ -3,14 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-//use crate::container::Container;
 use crate::linux_abi::*;
-use crate::mount::{get_mount_fs_type, remove_mounts, TYPEROOTFS};
+use crate::mount::{get_mount_fs_type, remove_mounts, TYPE_ROOTFS};
 use crate::namespace::Namespace;
+use crate::netlink::Handle;
 use crate::network::Network;
 use anyhow::{anyhow, Context, Result};
 use libc::pid_t;
-use netlink::{RtnlHandle, NETLINK_ROUTE};
 use oci::{Hook, Hooks};
 use protocols::agent::OnlineCPUMemRequest;
 use regex::Regex;
@@ -23,9 +22,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{thread, time};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct Sandbox {
@@ -43,8 +43,8 @@ pub struct Sandbox {
     pub storages: HashMap<String, u32>,
     pub running: bool,
     pub no_pivot_root: bool,
-    pub sender: Option<Sender<i32>>,
-    pub rtnl: Option<RtnlHandle>,
+    pub sender: Option<tokio::sync::oneshot::Sender<i32>>,
+    pub rtnl: Handle,
     pub hooks: Option<Hooks>,
     pub event_rx: Arc<Mutex<Receiver<String>>>,
     pub event_tx: Sender<String>,
@@ -54,7 +54,7 @@ impl Sandbox {
     pub fn new(logger: &Logger) -> Result<Self> {
         let fs_type = get_mount_fs_type("/")?;
         let logger = logger.new(o!("subsystem" => "sandbox"));
-        let (tx, rx) = mpsc::channel::<String>();
+        let (tx, rx) = channel::<String>(100);
         let event_rx = Arc::new(Mutex::new(rx));
 
         Ok(Sandbox {
@@ -71,9 +71,9 @@ impl Sandbox {
             sandbox_pidns: None,
             storages: HashMap::new(),
             running: false,
-            no_pivot_root: fs_type.eq(TYPEROOTFS),
+            no_pivot_root: fs_type.eq(TYPE_ROOTFS),
             sender: None,
-            rtnl: Some(RtnlHandle::new(NETLINK_ROUTE, 0).unwrap()),
+            rtnl: Handle::new()?,
             hooks: None,
             event_rx,
             event_tx: tx,
@@ -158,17 +158,19 @@ impl Sandbox {
         self.hostname = hostname;
     }
 
-    pub fn setup_shared_namespaces(&mut self) -> Result<bool> {
+    pub async fn setup_shared_namespaces(&mut self) -> Result<bool> {
         // Set up shared IPC namespace
         self.shared_ipcns = Namespace::new(&self.logger)
             .get_ipc()
             .setup()
+            .await
             .context("Failed to setup persistent IPC namespace")?;
 
         // // Set up shared UTS namespace
         self.shared_utsns = Namespace::new(&self.logger)
             .get_uts(self.hostname.as_str())
             .setup()
+            .await
             .context("Failed to setup persistent UTS namespace")?;
 
         Ok(true)
@@ -215,9 +217,9 @@ impl Sandbox {
         None
     }
 
-    pub fn destroy(&mut self) -> Result<()> {
+    pub async fn destroy(&mut self) -> Result<()> {
         for ctr in self.containers.values_mut() {
-            ctr.destroy()?;
+            ctr.destroy().await?;
         }
         Ok(())
     }
@@ -316,15 +318,17 @@ impl Sandbox {
         Ok(hooks)
     }
 
-    pub fn run_oom_event_monitor(&self, rx: Receiver<String>, container_id: String) {
-        let tx = self.event_tx.clone();
+    pub async fn run_oom_event_monitor(&self, mut rx: Receiver<String>, container_id: String) {
+        let mut tx = self.event_tx.clone();
         let logger = self.logger.clone();
 
-        thread::spawn(move || {
-            for event in rx {
+        tokio::spawn(async move {
+            loop {
+                let event = rx.recv().await;
                 info!(logger, "got an OOM event {:?}", event);
                 let _ = tx
                     .send(container_id.clone())
+                    .await
                     .map_err(|e| error!(logger, "failed to send message: {:?}", e));
             }
         });
@@ -412,7 +416,6 @@ fn online_memory(logger: &Logger) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //use rustjail::Error;
     use super::Sandbox;
     use crate::{mount::BareMount, skip_if_not_root};
     use anyhow::Error;
@@ -430,8 +433,8 @@ mod tests {
         baremount.mount()
     }
 
-    #[test]
-    fn set_sandbox_storage() {
+    #[tokio::test]
+    async fn set_sandbox_storage() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
 
@@ -464,8 +467,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remove_sandbox_storage() {
+    #[tokio::test]
+    async fn remove_sandbox_storage() {
         skip_if_not_root!();
 
         let logger = slog::Logger::root(slog::Discard, o!());
@@ -520,9 +523,9 @@ mod tests {
         assert!(s.remove_sandbox_storage(destdir_path).is_ok());
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(unused_assignments)]
-    fn unset_and_remove_sandbox_storage() {
+    async fn unset_and_remove_sandbox_storage() {
         skip_if_not_root!();
 
         let logger = slog::Logger::root(slog::Discard, o!());
@@ -572,8 +575,8 @@ mod tests {
         assert!(s.unset_and_remove_sandbox_storage(&other_dir_str).is_err());
     }
 
-    #[test]
-    fn unset_sandbox_storage() {
+    #[tokio::test]
+    async fn unset_sandbox_storage() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
 
@@ -655,8 +658,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn get_container_entry_exist() {
+    #[tokio::test]
+    async fn get_container_entry_exist() {
         skip_if_not_root!();
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
@@ -668,8 +671,8 @@ mod tests {
         assert!(cnt.is_some());
     }
 
-    #[test]
-    fn get_container_no_entry() {
+    #[tokio::test]
+    async fn get_container_no_entry() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
 
@@ -677,8 +680,8 @@ mod tests {
         assert!(cnt.is_none());
     }
 
-    #[test]
-    fn add_and_get_container() {
+    #[tokio::test]
+    async fn add_and_get_container() {
         skip_if_not_root!();
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
@@ -687,8 +690,9 @@ mod tests {
         s.add_container(linux_container);
         assert!(s.get_container("some_id").is_some());
     }
-    #[test]
-    fn update_shared_pidns() {
+
+    #[tokio::test]
+    async fn update_shared_pidns() {
         skip_if_not_root!();
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
@@ -704,8 +708,9 @@ mod tests {
         let ns_path = format!("/proc/{}/ns/pid", test_pid);
         assert_eq!(s.sandbox_pidns.unwrap().path, ns_path);
     }
-    #[test]
-    fn add_guest_hooks() {
+
+    #[tokio::test]
+    async fn add_guest_hooks() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let tmpdir = Builder::new().tempdir().unwrap();
@@ -727,8 +732,8 @@ mod tests {
         assert!(s.hooks.as_ref().unwrap().poststop.is_empty());
     }
 
-    #[test]
-    pub fn test_sandbox_is_running() {
+    #[tokio::test]
+    async fn test_sandbox_is_running() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         s.running = true;
@@ -737,8 +742,8 @@ mod tests {
         assert!(!s.is_running());
     }
 
-    #[test]
-    fn test_sandbox_set_hostname() {
+    #[tokio::test]
+    async fn test_sandbox_set_hostname() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
         let hostname = "abc123";
@@ -746,11 +751,11 @@ mod tests {
         assert_eq!(s.hostname, hostname);
     }
 
-    #[test]
-    fn test_sandbox_set_destroy() {
+    #[tokio::test]
+    async fn test_sandbox_set_destroy() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut s = Sandbox::new(&logger).unwrap();
-        let ret = s.destroy();
+        let ret = s.destroy().await;
         assert!(ret.is_ok());
     }
 }
